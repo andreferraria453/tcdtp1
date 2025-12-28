@@ -1,0 +1,84 @@
+    def run_cross_validation(self, n_splits=10, n_repeats=10):
+        """
+        Cross-validation que divide PARTICIPANTES em K folds.
+        
+        Parameters:
+        -----------
+        n_splits : int
+            Número de folds (divide participantes)
+        n_repeats : int
+            Número de repetições com shuffle diferente
+        """
+        results = []
+        cms = []
+        
+        if self.subject_aware_mode:
+            for name, model in self.models.items():
+                param_grid = self.model_parameters.get(name, {})
+
+                for params in self._generate_configs(param_grid):
+                    scores = {"Accuracy": [], "Recall": [], "Precision": [], "F1": []}
+                    cms_local = []
+
+                    for repeat in range(n_repeats):
+                        # Cria folds dividindo PARTICIPANTES
+                        folds = split_subjects_kfold(
+                            self.subjects, 
+                            n_splits=n_splits, 
+                            random_state=self.random_state + repeat
+                        )
+                        
+                        for fold_idx, (train_subjects, test_subjects) in enumerate(folds):
+                            # Cria máscaras por participantes
+                            train_mask = np.isin(self.subjects, train_subjects)
+                            test_mask = np.isin(self.subjects, test_subjects)
+                            
+                            X_train, X_test = self.X[train_mask], self.X[test_mask]
+                            y_train, y_test = self.y[train_mask], self.y[test_mask]
+                            
+                            model.set_params(**params)
+                            model.fit(X_train, y_train)
+                            pred = model.predict(X_test)
+
+                            metrics = compute_metrics(y_test, pred)
+                            cm = confusion_matrix(y_test, pred, labels=self.labels)
+
+                            for m in scores:
+                                scores[m].append(metrics[m])
+                            cms_local.append(cm)
+
+                    row = {"Model": name, **params, **{m: np.mean(scores[m]) for m in scores}}
+                    results.append(row)
+                    cms.append(np.sum(cms_local, axis=0))
+                    
+        else:            
+            for name, model in self.models.items():
+                param_grid = self.model_parameters.get(name, {})
+
+                for params in self._generate_configs(param_grid):
+                    scores = {"Accuracy": [], "Recall": [], "Precision": [], "F1": []}
+                    cms_local = []
+
+                    for repeat in range(n_repeats):
+                        folds = split_data_kfold(self.X, n_splits=n_splits, random=repeat)
+                        for train_idx, test_idx in folds:
+                            X_train, X_test = self.X[train_idx], self.X[test_idx]
+                            y_train, y_test = self.y[train_idx], self.y[test_idx]
+                            
+                            model.set_params(**params)
+                            model.fit(X_train, y_train)
+                            pred = model.predict(X_test)
+
+                            metrics = compute_metrics(y_test, pred)
+                            cm = confusion_matrix(y_test, pred, labels=self.labels)
+
+                            for m in scores:
+                                scores[m].append(metrics[m])
+                            cms_local.append(cm)
+
+                    row = {"Model": name, **params, **{m: np.mean(scores[m]) for m in scores}}
+                    results.append(row)
+                    cms.append(np.sum(cms_local, axis=0))
+
+        cm_total = np.sum(cms, axis=0)
+        return pd.DataFrame(results), cms, cm_total

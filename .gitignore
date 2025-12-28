@@ -1,0 +1,18 @@
+
+.venv/
+venv/
+env/
+
+FORTH_TRACE_DATASET/
+
+*__pycache__/
+*.py[cod]
+
+# --- VS Code ---
+.vscode/
+
+# --- Mac OS (Opcional, se usares Mac) ---
+.DS_Store
+
+*.csv
+outputs/*.csv
