@@ -235,9 +235,109 @@ class Experiment:
                     self._plot_history(history, f"{name} {params}")
 
         return pd.DataFrame(results), cms, np.sum(cms, axis=0)
-
-
     def run_tvt_with_feature_selection(self, val_size=0.2, test_size=0.2, 
+                                        feature_ranking=None, train_subjects=None,
+                                        val_subjects=None, test_subjects=None,
+                                        epochs=None): 
+            
+            # 1. Split dos dados
+            if train_subjects is not None:
+                X_train, X_val, X_test, y_train, y_val, y_test = self.split_tvt_manual(train_subjects, val_subjects, test_subjects)
+            else:
+                X_train, X_val, X_test, y_train, y_val, y_test = self.split_tvt(val_size=val_size, test_size=test_size)
+            
+            # 2. Scaling
+            X_train, X_val, X_test = self._scale_data(X_train, X_val, X_test)
+
+            # 3. Ranking de Features (ReliefF)
+            if feature_ranking is None:
+                print("Computing ReliefF...")
+                relief = ReliefF(n_neighbors=100, n_jobs=-1)
+                relief.fit(X_train, y_train)
+                ranking = np.argsort(-relief.feature_importances_)
+            else:
+                ranking = feature_ranking
+            
+            num_features = X_train.shape[1]
+            models_results = []
+            
+            for name, model_original in self.models.items():
+                model_results = {}
+                param_grid = self.model_parameters.get(name, {})
+                
+                # --- PASSO A: Seleção do k ótimo ---
+                validation_f1s_model = []
+                for k in range(1, num_features + 1):
+                    model = copy.deepcopy(model_original)
+                    sel_feat = ranking[:k]
+                    f1_val, _, _ = self._train_eval_model(
+                        model, X_train[:, sel_feat], y_train, 
+                        X_val[:, sel_feat], y_val, epochs=epochs
+                    )
+                    validation_f1s_model.append({
+                        "model": name, "F1": f1_val, "k_features": k, 
+                        "selected_features": sel_feat.tolist()
+                    })
+                
+                model_results["feature_selection_steps"] = validation_f1s_model
+                
+                f1_vals = [entry['F1'] for entry in validation_f1s_model]
+                best_k = validation_f1s_model[np.argmax(f1_vals)]['k_features']
+                best_features_indices = ranking[:best_k]
+                
+                # --- PASSO B: Busca de Hiperparâmetros ---
+                hyperparam_search_results = []
+                best_params = None
+                best_f1_val = -1
+                
+                for params in self._generate_configs(param_grid):
+                    model = copy.deepcopy(model_original)
+                    model.set_params(**params)
+                    
+                    f1, _, _ = self._train_eval_model(
+                        model, X_train[:, best_features_indices], y_train, 
+                        X_val[:, best_features_indices], y_val, epochs=epochs
+                    )
+                    
+                    hyperparam_search_results.append({
+                        "params": params, "validation_f1": f1, "k_used": best_k
+                    })
+                    
+                    if f1 > best_f1_val:
+                        best_f1_val = f1
+                        best_params = params
+                
+                model_results["hyperparameter_search"] = hyperparam_search_results
+
+                
+                # Unir Train e Val
+                X_train_val = np.vstack((X_train, X_val))
+                y_train_val = np.concatenate((y_train, y_val))
+                
+                # Criar modelo final com os melhores parâmetros
+                final_model = copy.deepcopy(model_original)
+                final_model.set_params(**best_params)
+                
+                # Treinar no conjunto expandido 
+                final_model.fit(X_train_val[:, best_features_indices], y_train_val)
+                
+                # --- PASSO D: TESTE FINAL ---
+                y_test_pred = final_model.predict(X_test[:, best_features_indices])
+                metrics_test = compute_metrics(y_test, y_test_pred)
+                
+                model_results["test"] = {
+                    "model": name, 
+                    "F1": metrics_test["F1"], 
+                    "best_k": best_k, 
+                    "best_params": best_params,
+                    "metrics": metrics_test
+                }
+
+                models_results.append(model_results)
+                    
+            return models_results
+
+    def run_tvt_with_feature_selection_old(self, val_size=0.2, test_size=0.2, 
                                        feature_ranking=None, train_subjects=None,
                                        val_subjects=None, test_subjects=None,
                                        epochs=None): 
@@ -316,21 +416,28 @@ class Experiment:
         return models_results
 
  
+
     def run_cross_validation(self, n_splits=10, n_repeats=10):
         all_results = []
         cm_stats = {}
-        for name, model in self.models.items():
+
+        for name, model_original in self.models.items():
             param_grid = self.model_parameters.get(name, {})
+            
             for params in self._generate_configs(param_grid):
-                fold_metrics = {"Accuracy": [], "Recall": [], "Precision": [], "F1": []}
+                # Inicializa listas para todas as métricas dinamicamente
+                fold_metrics = {metric: [] for metric in ["Accuracy", "Recall", "Precision", "F1"]}
                 fold_cms = []
+
                 for repeat in range(n_repeats):
+                    # Gerar os folds
                     if self.subject_aware_mode:
                         folds = split_subjects_kfold(self.subjects, n_splits=n_splits, random_state=self.random_state + repeat)
                     else:
                         folds = split_data_kfold(self.X, n_splits=n_splits, random=repeat)
 
                     for fold_idx, (train_idx, test_idx) in enumerate(folds):
+                        # Seleção de dados
                         if self.subject_aware_mode:
                             train_mask = np.isin(self.subjects, train_idx)
                             test_mask = np.isin(self.subjects, test_idx)
@@ -340,28 +447,65 @@ class Experiment:
                             X_train, X_test = self.X[train_idx], self.X[test_idx]
                             y_train, y_test = self.y[train_idx], self.y[test_idx]
                         
-                        X_train, X_test = self._scale_data(X_train, X_test)
+                        # Scaling (Fit apenas no treino para evitar leakage)
+                        X_train_sc, X_test_sc = self._scale_data(X_train, X_test)
+                        
+                        # Configurar e treinar modelo
+                        model = copy.deepcopy(model_original) # Importante: usar cópia limpa
                         model.set_params(**params)
-                        model.fit(X_train, y_train)
-                        pred = model.predict(X_test)
+                        model.fit(X_train_sc, y_train)
+                        
+                        # Predição e Métricas
+                        pred = model.predict(X_test_sc)
                         m = compute_metrics(y_test, pred)
                         cm = compute_confusion_matrix(y_test, pred, labels=self.labels)
-                        for k in fold_metrics: fold_metrics[k].append(m[k])
+                        
+                        # Guardar métricas e matriz
+                        for k in fold_metrics:
+                            fold_metrics[k].append(m[k])
                         fold_cms.append(cm)
 
+                # --- Processamento dos Resultados por Configuração ---
                 config_result = {
-                    "Model": name, **params,
-                    "Acc_Mean": np.mean(fold_metrics["Accuracy"]), "Acc_Std": np.std(fold_metrics["Accuracy"]),
-                    "F1_Mean": np.mean(fold_metrics["F1"]), "F1_Std": np.std(fold_metrics["F1"])
+                    "Model": name,
+                    **params
                 }
+                
+                # Adiciona média e std de TODAS as métricas dinamicamente
+                for metric_name, values in fold_metrics.items():
+                    config_result[f"{metric_name}_Mean"] = np.mean(values)
+                    config_result[f"{metric_name}_Std"] = np.std(values)
+                
                 all_results.append(config_result)
-                cms_array = np.array(fold_cms)
-                cm_stats[f"{name}_{str(params)}"] = {
-                    "mean": np.mean(cms_array, axis=0),
-                    "total": np.sum(cms_array, axis=0)
+                
+                # --- Processamento das Matrizes de Confusão ---
+                # Converter lista de DataFrames para um array 3D para cálculos numéricos
+                cms_values = [df.values for df in fold_cms]
+                cms_array = np.array(cms_values)
+                
+                # Criar identificador único para o dicionário de matrizes
+                config_id = f"{name}_{str(params)}"
+                
+                cm_stats[config_id] = {
+                    "all_matrices": fold_cms,                          # Todas as matrizes individuais (Lista de DataFrames)
+                    "mean_matrix": pd.DataFrame(                       # Média das matrizes formatada
+                        np.mean(cms_array, axis=0), 
+                        index=fold_cms[0].index, 
+                        columns=fold_cms[0].columns
+                    ),
+                    "std_matrix": pd.DataFrame(                        # Desvio padrão das matrizes formatada
+                        np.std(cms_array, axis=0), 
+                        index=fold_cms[0].index, 
+                        columns=fold_cms[0].columns
+                    ),
+                    "total_matrix": pd.DataFrame(                      # Soma total das matrizes formatada
+                        np.sum(cms_array, axis=0), 
+                        index=fold_cms[0].index, 
+                        columns=fold_cms[0].columns
+                    )
                 }
+                
         return pd.DataFrame(all_results), cm_stats
-
     def run_cross_with_validation_feature_selection(self, number_of_folds=10, n_repeats=1, test_size=0.3, feature_ranking=None):
         all_results = []
         for repeat in range(n_repeats):
@@ -600,6 +744,60 @@ class Experiment:
                     "total": np.sum(cms_array, axis=0)
                 }
         return pd.DataFrame(all_results), cm_stats
+
+
+"""
+
+
+"""
+
+    def run_cross_validation(self, n_splits=10, n_repeats=10):
+        all_results = []
+        cm_stats = {}
+        for name, model in self.models.items():
+            param_grid = self.model_parameters.get(name, {})
+            for params in self._generate_configs(param_grid):
+                fold_metrics = {"Accuracy": [], "Recall": [], "Precision": [], "F1": []}
+                fold_cms = []
+                for repeat in range(n_repeats):
+                    if self.subject_aware_mode:
+                        folds = split_subjects_kfold(self.subjects, n_splits=n_splits, random_state=self.random_state + repeat)
+                    else:
+                        folds = split_data_kfold(self.X, n_splits=n_splits, random=repeat)
+
+                    for fold_idx, (train_idx, test_idx) in enumerate(folds):
+                        if self.subject_aware_mode:
+                            train_mask = np.isin(self.subjects, train_idx)
+                            test_mask = np.isin(self.subjects, test_idx)
+                            X_train, X_test = self.X[train_mask], self.X[test_mask]
+                            y_train, y_test = self.y[train_mask], self.y[test_mask]
+                        else:
+                            X_train, X_test = self.X[train_idx], self.X[test_idx]
+                            y_train, y_test = self.y[train_idx], self.y[test_idx]
+                        
+                        X_train, X_test = self._scale_data(X_train, X_test)
+                        model.set_params(**params)
+                        model.fit(X_train, y_train)
+                        pred = model.predict(X_test)
+                        m = compute_metrics(y_test, pred)
+                        cm = compute_confusion_matrix(y_test, pred, labels=self.labels)
+                        for k in fold_metrics: fold_metrics[k].append(m[k])
+                        fold_cms.append(cm)
+
+                config_result = {
+                    "Model": name, **params,
+                    "Acc_Mean": np.mean(fold_metrics["Accuracy"]), "Acc_Std": np.std(fold_metrics["Accuracy"]),
+                    "F1_Mean": np.mean(fold_metrics["F1"]), "F1_Std": np.std(fold_metrics["F1"])
+                }
+                all_results.append(config_result)
+                cms_array = np.array(fold_cms)
+                cm_stats[f"{name}_{str(params)}"] = {
+                    "mean": np.mean(cms_array, axis=0),
+                    "total": np.sum(cms_array, axis=0)
+                }
+        return pd.DataFrame(all_results), cm_stats
+
+
 
 
 """
