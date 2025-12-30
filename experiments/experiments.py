@@ -81,33 +81,41 @@ class Experiment:
         return (X_train_scaled, *X_others_scaled)
 
     def _plot_history(self, history, title):
-        """Gera gráficos de Accuracy e Loss se houver histórico."""
         if not history: return
-        epochs_range = range(1, len(history['train_acc']) + 1)
+        epochs_range = range(1, len(history['train_f1']) + 1)
         
         plt.figure(figsize=(12, 4))
-        # Accuracy Plot
+        
+        # Gráfico 1: F1 Score (Em vez de Accuracy)
         plt.subplot(1, 2, 1)
-        plt.plot(epochs_range, history['train_acc'], label='Train Acc')
-        plt.plot(epochs_range, history['val_acc'], label='Val Acc', linestyle="--")
-        plt.title(f'Accuracy: {title}')
+        plt.plot(epochs_range, history['train_f1'], label='Train F1', color='blue')
+        plt.plot(epochs_range, history['val_f1'], label='Val F1', color='orange', linestyle="--")
+        
+        # Marcar o ponto máximo de validação
+        max_val = max(history['val_f1'])
+        max_epoch = history['val_f1'].index(max_val) + 1
+        plt.scatter(max_epoch, max_val, color='red', zorder=5)
+        plt.text(max_epoch, max_val + 0.01, f"{max_val:.3f}", fontsize=9)
+
+        plt.title(f'F1 Score: {title}')
         plt.xlabel('Epochs')
-        plt.ylabel('Accuracy')
+        plt.ylabel('F1 Score')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        # Loss Plot
+        
+        # Gráfico 2: Loss
         if history['loss']:
             plt.subplot(1, 2, 2)
             plt.plot(epochs_range, history['loss'], label='Loss', color='red')
-            plt.title('Loss')
+            plt.title('Loss Curve')
             plt.xlabel('Epochs')
+            plt.ylabel('Loss')
             plt.grid(True, alpha=0.3)
+            
         plt.tight_layout()
         plt.show()
 
-    # -------------------------------------------------------
-    # CORE: TREINO HÍBRIDO (FIT ou PARTIAL_FIT)
-    # -------------------------------------------------------
+
     def _train_eval_model(self, model, X_train, y_train, X_val, y_val, epochs=None):
         if epochs is None or not hasattr(model, "partial_fit"):
             model.fit(X_train, y_train)
@@ -120,20 +128,30 @@ class Experiment:
         all_classes = self.labels
         best_val_f1 = -1
         best_model_state = None
-        history = {'train_acc': [], 'val_acc': [], 'loss': []}
+        # Agora guardamos F1 em vez de Acc
+        history = {'train_f1': [], 'val_f1': [], 'loss': []}
         
         for _ in range(epochs):
             model.partial_fit(X_train, y_train, classes=all_classes)
             
+            # 1. Calcular F1 na Validação (Decisão)
             pred_val = model.predict(X_val)
             val_f1 = compute_metrics(y_val, pred_val)["F1"]
             
+            # 2. Calcular F1 no Treino (Apenas para o gráfico)
+            # Nota: Isto torna o treino ligeiramente mais lento, mas o gráfico fica correto.
+            # Se for muito lento, podes usar model.score(X_train, y_train) e mudar a label para Accuracy.
+            pred_train = model.predict(X_train)
+            train_f1 = compute_metrics(y_train, pred_train)["F1"]
+            
             # Guardar histórico
-            history['train_acc'].append(model.score(X_train, y_train))
-            history['val_acc'].append(model.score(X_val, y_val))
-            if hasattr(model, 'loss_'): history['loss'].append(model.loss_)
+            history['train_f1'].append(train_f1)
+            history['val_f1'].append(val_f1)
+            
+            if hasattr(model, 'loss_'): 
+                history['loss'].append(model.loss_)
 
-            # Checkpoint (Guardar melhor modelo)
+            # Checkpoint (Guardar melhor modelo com base no F1)
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
                 best_model_state = copy.deepcopy(model)
