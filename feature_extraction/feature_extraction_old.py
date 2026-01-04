@@ -1,193 +1,4 @@
 import pandas as pd
-import numpy as np
-
-def detect_gaps(timestamps, gap_threshold):
-    """
-    Deteta intervalos onde a diferença entre amostras consecutivas excede o threshold.
-    timestamps: numpy array de floats/ints (ordenado)
-    gap_threshold: valor máximo permitido entre amostras
-    Retorna: lista de tuplos (gap_start, gap_end)
-    """
-    # Calcula a diferença entre amostras consecutivas
-    diffs = np.diff(timestamps)
-    
-    # Encontra índices onde a diferença é maior que o permitido
-    gap_indices = np.where(diffs > gap_threshold)[0]
-    
-    gaps = []
-    for idx in gap_indices:
-        # O gap ocorre entre o elemento idx e o elemento idx+1
-        start_gap = timestamps[idx]
-        end_gap = timestamps[idx + 1]
-        gaps.append((start_gap, end_gap))
-        
-    return gaps
-
-def intersects_gap(win_start, win_end, gap_list):
-    """
-    Verifica se a janela [win_start, win_end) intersecta algum gap.
-    """
-    for g_start, g_end in gap_list:
-        # Lógica de intersecção:
-        # (StartGap < WinEnd) E (EndGap > WinStart)
-        if g_start < win_end and g_end > win_start:
-            return True
-    return False
-
-def create_sliding_windows(df, window_ms, step_ms, gap_threshold_ms=100):
-    print("A preparar dados e detetar gaps...")
-    
-    # 1. Preparação Básica
-    # Garantir ordenação (Crucial para searchsorted e diff)
-    df = df.sort_values(by=["participant_id", "device_id", "timestamp"]).reset_index(drop=True)
-    
-    # Identificar colunas
-    if 'activity_label' in df.columns: lbl_col = 'activity_label'
-    elif 'actitivy_label' in df.columns: lbl_col = 'actitivy_label'
-    else: lbl_col = 'activity'
-    
-    # Colunas de sensores para extrair
-    sensor_cols = [c for c in df.columns if c not in 
-                   ['participant_id', 'device_id', 'timestamp', 'datetime', 'grid_time', lbl_col, 'window_id']]
-
-    # Estruturas de dados para o loop
-    windows_data = []
-    w_id_global = 0
-    
-    # 2. Iterar por Participante (Processamento Independente)
-    for p_id, df_p in df.groupby("participant_id"):
-        
-        # Dicionários para acesso rápido aos dados deste participante
-        # Chave: device_id -> Valor: (timestamps_array, labels_array, values_matrix)
-        devices_data = {}
-        device_gaps = {}
-        device_bounds = []
-        
-        unique_devices = df_p['device_id'].unique()
-        
-        # --- PRÉ-PROCESSAMENTO DO PARTICIPANTE ---
-        valid_participant = True
-        
-        for d_id in unique_devices:
-            # Extrair dados do dispositivo
-            df_d = df_p[df_p['device_id'] == d_id]
-            ts = df_d['timestamp'].values
-            
-            if len(ts) == 0:
-                valid_participant = False
-                break
-                
-            # Detetar Gaps
-            gaps = detect_gaps(ts, gap_threshold_ms)
-            device_gaps[d_id] = gaps
-            
-            # Guardar dados em memória (numpy é mais rápido que pandas no loop)
-            # Guardamos o DataFrame slice também para facilitar a extração final
-            devices_data[d_id] = {
-                'ts': ts,
-                'lbl': df_d[lbl_col].values,
-                'df_slice': df_d  # Mantemos o slice do pandas para extrair colunas depois
-            }
-            
-            # Guardar limites (min, max)
-            device_bounds.append((ts[0], ts[-1]))
-            
-        if not valid_participant or not device_bounds:
-            continue
-            
-        # 3. CALCULAR JANELA DE OPERAÇÃO COMUM (Global Bounds)
-        # O início global é o MAIOR dos inícios (todos têm de ter começado)
-        start_global = max(b[0] for b in device_bounds)
-        # O fim global é o MENOR dos fins (todos têm de estar ativos)
-        end_global = min(b[1] for b in device_bounds)
-        
-        # Se a janela útil for menor que o tamanho da janela, ignorar participante
-        if (end_global - start_global) < window_ms:
-            continue
-            
-        # 4. LOOP DE GERAÇÃO DE JANELAS
-        curr_time = start_global
-        
-        while curr_time + window_ms <= end_global:
-            win_start = curr_time
-            win_end = curr_time + window_ms
-            
-            window_is_valid = True
-            temp_window_chunks = [] # Para armazenar os dados se a janela for válida
-            
-            # Validar contra TODOS os dispositivos
-            for d_id in unique_devices:
-                # A. Checar Gaps
-                if intersects_gap(win_start, win_end, device_gaps[d_id]):
-                    window_is_valid = False
-                    break
-                
-                # B. Obter Índices (SearchSorted é O(log N) - Muito Rápido)
-                ts_arr = devices_data[d_id]['ts']
-                # Encontrar onde começa e onde acaba a janela neste array
-                idx_start = np.searchsorted(ts_arr, win_start, side='left')
-                idx_end = np.searchsorted(ts_arr, win_end, side='left')
-                
-                # C. Validar se existem dados suficientes (opcional mas recomendado)
-                # Se searchsorted devolver o mesmo índice, não há dados no intervalo
-                if idx_start == idx_end:
-                    window_is_valid = False
-                    break
-                    
-                # D. Verificar pureza das labels
-                lbl_arr = devices_data[d_id]['lbl']
-                labels_in_window = lbl_arr[idx_start:idx_end]
-                
-                # np.unique é rápido. Se len > 1, tem labels misturadas.
-                if len(np.unique(labels_in_window)) > 1:
-                    window_is_valid = False
-                    break
-                
-                # Se passou tudo, preparar o chunk
-                # Pegamos o slice do DataFrame original usando iloc relativo
-                df_slice = devices_data[d_id]['df_slice'].iloc[idx_start:idx_end].copy()
-                temp_window_chunks.append(df_slice)
-            
-            # SE A JANELA FOR VÁLIDA EM TODOS OS DEVICES
-            if window_is_valid:
-                # Concatenar todos os chunks desta janela
-                # (Eles ficam empilhados verticalmente, como tinhas no original)
-                win_df = pd.concat(temp_window_chunks)
-                win_df['window_id'] = w_id_global
-                windows_data.append(win_df)
-                
-                w_id_global += 1
-            
-            # Avançar no tempo
-            curr_time += step_ms
-
-    print(f"Processamento concluído. {len(windows_data)} janelas geradas.")
-    
-    if not windows_data:
-        return pd.DataFrame()
-
-    # 5. RECONSTRUÇÃO FINAL
-    final_df = pd.concat(windows_data, ignore_index=True)
-    
-    # Recriação das Colunas de Array (Listas) para TSFresh
-    acc_cols = ['accelerometer_x', 'accelerometer_y', 'accelerometer_z']
-    gyro_cols = ['gyroscope_x', 'gyroscope_y', 'gyroscope_z']
-    mag_cols = ['magnetometer_x', 'magnetometer_y', 'magnetometer_z']
-    
-    # Verifica quais colunas existem e cria as listas
-    if all(c in final_df.columns for c in acc_cols):
-        final_df['acc_array'] = final_df[acc_cols].values.tolist()
-    if all(c in final_df.columns for c in gyro_cols):
-        final_df['gyro_array'] = final_df[gyro_cols].values.tolist()
-    if all(c in final_df.columns for c in mag_cols):
-        final_df['mag_array'] = final_df[mag_cols].values.tolist()
-    if all(c in final_df.columns for c in acc_cols + gyro_cols):
-        final_df['acc_gyro_array'] = final_df[acc_cols + gyro_cols].values.tolist()
-
-    return final_df
-
-
-import pandas as pd
 import tsfresh
 from tsfresh.feature_extraction.feature_calculators import set_property
 from tsfresh.feature_extraction import feature_calculators
@@ -367,16 +178,10 @@ def mean_crossing_rate(x):
 
 @set_property("fctype", "simple")
 def spectral_entropy(x: pd.Series) -> float:
-    y = np.array(x, dtype=float) 
-    y = y - y.mean()
-    psd = np.abs(np.fft.rfft(y)) ** 2
-    psd_sum = psd.sum()
-    if psd_sum == 0:
-        return 0.0
-    p = psd / psd_sum
-    p = p[p > 0]
-    se = -np.sum(p * np.log2(p))
-    return float(se / np.log2(len(psd)))
+    """
+    Calcula a entropia espectral da magnitude 3D (acc_array).
+    """
+    return 1
 @set_property("fctype", "simple")
 def interq_range(x):
     """
@@ -458,55 +263,68 @@ setattr(tsfresh.feature_extraction.feature_calculators,"dominant_frequency_axis"
 setattr(tsfresh.feature_extraction.feature_calculators,"energy_axis",energy_axis)
 
 
+def create_sliding_windows(df, window_size, step_size):
+    windows = []
+
+    for device_id in DEVICES:
+        df_sensor = df[df['device_id'] == device_id].copy()
+        window_id = 0
+        
+        for start in range(0, len(df_sensor) - window_size + 1, step_size):
+            end = start + window_size
+            window = df_sensor.iloc[start:end].copy()
+            window["window_id"] = window_id
+            window["device_id"] = device_id
+            
+            # Arrays para funções combiner
+            window[ACC_ARRAY_COLUMN] = window.apply(lambda row: np.array([
+                row['accelerometer_x'],
+                row['accelerometer_y'],
+                row['accelerometer_z']
+            ]), axis=1)
+            
+            window[GYRO_ARRAY_COLUMN] = window.apply(lambda row: np.array([
+                row['gyroscope_x'],
+                row['gyroscope_y'],
+                row['gyroscope_z']
+            ]), axis=1)
+            window[ACC_GYRO_COLUMN] = window.apply(lambda row: np.array([
+                row['accelerometer_x'],
+                row['accelerometer_y'],
+                row['accelerometer_z'],
+                row['gyroscope_x'],
+                row['gyroscope_y'],
+                row['gyroscope_z']
+            ]), axis=1)
+            
+            windows.append(window)
+            window_id += 1
+    
+    return pd.concat(windows, ignore_index=True)
 
 
 
-
-def to_long_format(df, label_col='actitivy_label'):
+def to_long_format(df):
     df = df.copy()
-
-    # 1. Criar o ID Único (User_Device_Window)
-    # Convertemos para int->str para garantir formato limpo "14_1_0"
-    p_str = df['participant_id'].astype(float).astype(int).astype(str)
-    d_str = df['device_id'].astype(float).astype(int).astype(str)
-    w_str = df['window_id'].astype(float).astype(int).astype(str)
+    df['time'] = df.groupby(['device_id','window_id']).cumcount()
+    # id único combinando sensor + janela
+    df['id'] = df['device_id'].astype(str) + "_" + df['window_id'].astype(str)
     
-    df['id'] = p_str + "_" + d_str + "_" + w_str
-
-    # 2. Extrair o Mapeamento de Labels (ID -> Activity)
-    # Como assumimos que a janela é pura, basta pegar a primeira linha de cada ID
-    labels_map = df.drop_duplicates(subset=['id']).set_index('id')[label_col]
-
-    # 3. Criar Eixo do Tempo (0, 1, 2... N dentro da janela)
-    df['time'] = df.groupby('id').cumcount()
-
-    # 4. Transformar em Long Format (Melt)
-    vars_to_melt = (
-        COLUMNS_ACCELEROMETER + 
-        COLUMNS_GYROSCOPE + 
-        COLUMNS_MAGNETOMETER + 
-        [ACC_GYRO_COLUMN, ACC_ARRAY_COLUMN, GYRO_ARRAY_COLUMN]
-    )
-    
-    # Filtra apenas as colunas que realmente existem no df
-    vars_present = [v for v in vars_to_melt if v in df.columns]
-
     long_df = df.melt(
         id_vars=['id', 'time'],
-        value_vars=vars_present,
+        value_vars=COLUMNS_ACCELEROMETER + COLUMNS_GYROSCOPE + COLUMNS_MAGNETOMETER + [ACC_GYRO_COLUMN, ACC_ARRAY_COLUMN, GYRO_ARRAY_COLUMN],
         var_name='kind',
         value_name='value'
     )
     
-    # Retorna o DataFrame Longo E o Mapa de Labels
-    return long_df, labels_map
+    return long_df
 
 
 def df_to_tsfresh_format(df):
     long_df = pd.DataFrame()
     
     for col in df.columns:
-        if col in ["window_id", "time", "device_id", "id","participant_id"]:
+        if col in ["window_id", "time", "device_id", "id"]:
             continue
         
         tmp = pd.DataFrame({
@@ -523,21 +341,16 @@ def df_to_tsfresh_format(df):
 
 def extract_features_sensors(dataframe, window_size, step_size):
     # 1) Criar janelas
-    print("starting")
-    df_windowed = create_sliding_windows(
-    df=dataframe, 
-    window_ms=window_size,           # Quero 2 segundos
-    step_ms=step_size   # 50% de sobreposição
-)
+    df_windowed = create_sliding_windows(dataframe, window_size, step_size)
 
-   
+    # 2) Selecionar colunas necessárias
     df = df_windowed[
         COLUMNS_ACCELEROMETER +
         COLUMNS_GYROSCOPE +
         COLUMNS_MAGNETOMETER +
-        ["device_id","window_id","participant_id","actitivy_label", ACC_GYRO_COLUMN, ACC_ARRAY_COLUMN, GYRO_ARRAY_COLUMN]
+        ["device_id","window_id", ACC_GYRO_COLUMN, ACC_ARRAY_COLUMN, GYRO_ARRAY_COLUMN]
     ]
-    long_df,labels = to_long_format(df)
+    long_df = to_long_format(df)
     
 
     stat_features = {
@@ -609,5 +422,4 @@ def extract_features_sensors(dataframe, window_size, step_size):
         kind_to_fc_parameters=kind_to_fc_parameters,
         n_jobs=0
     )
-    features['activity'] = labels
     return features

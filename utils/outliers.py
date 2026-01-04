@@ -30,7 +30,6 @@ def identify_outliers_z_score(data, k=3):
 def inject_outliers(data, x, k, z):
     """Injeta outliers em um conjunto de dados para atingir uma densidade desejada de outliers."""
     data = np.array(data, dtype=float)
-    print(f"inside")
     # Force 2D
     if data.ndim == 1:
         data = data.reshape(-1, 1)

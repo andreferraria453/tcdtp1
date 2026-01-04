@@ -217,7 +217,7 @@ class Experiment:
 
         if random_state is None: random_state = self.random_state
         
-        # 1. Split (Train / Val / Test)
+  
         X_train, X_val, X_test, y_train, y_val, y_test = self.split_tvt(
             val_size=val_size, test_size=test_size, random_state=random_state
         )
@@ -234,21 +234,18 @@ class Experiment:
                 model = copy.deepcopy(model_original)
                 model.set_params(**params)
                 
-                print(f"Treinando {name} {params} (Epochs={epochs})...")
 
-                # CHAMA O HELPER INTELIGENTE
                 _, best_model, history = self._train_eval_model(
                     model, X_train, y_train, X_val, y_val, epochs=epochs
                 )
 
-                # Avaliação final no Teste
                 pred = best_model.predict(X_test)
                 metrics = compute_metrics(y_test, pred)
                 cm = compute_confusion_matrix(y_test, pred, labels=self.labels)
                 results.append({"Model": name, **params, **metrics})
                 cms.append(cm)
 
-                # Plotar histórico se existir (só para este modelo/config)
+       
                 if history:
                     self._plot_history(history, f"{name} {params}")
 
@@ -269,7 +266,6 @@ class Experiment:
 
             # 3. Ranking de Features (ReliefF)
             if feature_ranking is None:
-                print("Computing ReliefF...")
                 relief = ReliefF(n_neighbors=100, n_jobs=-1)
                 relief.fit(X_train, y_train)
                 ranking = np.argsort(-relief.feature_importances_)
@@ -524,7 +520,128 @@ class Experiment:
                 }
                 
         return pd.DataFrame(all_results), cm_stats
+    
+
     def run_cross_with_validation_feature_selection(self, number_of_folds=10, n_repeats=1, test_size=0.3, feature_ranking=None):
+            all_results = []
+            for repeat in range(n_repeats):
+                cur_rnd = self.random_state + repeat
+                
+                # --- Definição dos Folds (Inalterado) ---
+                if self.subject_aware_mode:
+                    folds = split_subjects_kfold(self.subjects, n_splits=number_of_folds, random_state=cur_rnd)
+                else:
+                    folds = split_data_kfold(self.X, n_splits=number_of_folds, random=cur_rnd)
+                
+                for fold_id, fold_data in enumerate(folds):
+                    
+                    # --- Splits de Treino/Validação/Teste (Inalterado) ---
+                    if self.subject_aware_mode:
+                        train_subj, test_subj = fold_data
+                        train_mask = np.isin(self.subjects, train_subj)
+                        test_mask = np.isin(self.subjects, test_subj)
+                        X_train, X_test = self.X[train_mask], self.X[test_mask]
+                        y_train, y_test = self.y[train_mask], self.y[test_mask]
+                        
+                        # Inner Split (TrS vs Val)
+                        uniq_tr = np.unique(self.subjects[train_mask])
+                        np.random.shuffle(uniq_tr)
+                        n_val = max(1, int(len(uniq_tr) * test_size))
+                        val_subj_in = uniq_tr[:n_val]
+                        trs_subj_in = uniq_tr[n_val:]
+                        trs_mask = np.isin(self.subjects[train_mask], trs_subj_in)
+                        val_mask = np.isin(self.subjects[train_mask], val_subj_in)
+                        X_TrS, y_TrS = X_train[trs_mask], y_train[trs_mask]
+                        X_V, y_V = X_train[val_mask], y_train[val_mask]
+                    else:
+                        train_idx, test_idx = fold_data
+                        X_train, X_test = self.X[train_idx], self.X[test_idx]
+                        y_train, y_test = self.y[train_idx], self.y[test_idx]
+                        X_TrS, X_V, y_TrS, y_V = train_test_split(X_train, y_train, test_size=test_size, stratify=y_train, random_state=cur_rnd)
+
+                    # Scaling
+                    X_TrS_sc, X_V_sc = self._scale_data(X_TrS, X_V)
+                    X_train_sc, X_test_sc = self._scale_data(X_train, X_test)
+
+                    # Feature Selection (ReliefF)
+                    if feature_ranking is None:
+                        relief = ReliefF(n_neighbors=100)
+                        relief.fit(X_TrS_sc, y_TrS)
+                        ranking = np.argsort(-relief.feature_importances_)
+                    else:
+                        ranking = feature_ranking
+
+                    num_feat = X_train.shape[1]
+                    fold_res = {"repetition": repeat, "fold_id": fold_id, "models": []}
+
+                    for name, model_orig in self.models.items():
+                        param_grid = self.model_parameters.get(name, {})
+                        defaults = model_orig.get_params()
+                        def_params = {k: defaults.get(k) for k in param_grid.keys()}
+                        
+                        best_k = 1
+                        best_f1_k = -1
+                        
+                        # [NOVO] Lista para guardar o histórico de validação de features
+                        feature_selection_history = [] 
+
+                        # Find Best K (Standard fit)
+                        for k in range(1, num_feat + 1):
+                            model = copy.deepcopy(model_orig)
+                            model.set_params(**def_params)
+                            sel = ranking[:k]
+                            model.fit(X_TrS_sc[:, sel], y_TrS)
+                            y_pv = model.predict(X_V_sc[:, sel])
+                            
+                            f1 = compute_metrics(y_V, y_pv)["F1"]
+                            
+                            # [NOVO] Guarda o resultado atual
+                            feature_selection_history.append({
+                                "num_features": k,
+                                "val_f1": f1
+                            })
+
+                            if f1 > best_f1_k:
+                                best_f1_k = f1
+                                best_k = k
+                        
+                        best_feats = ranking[:best_k]
+                        best_params = def_params
+                        best_f1_p = best_f1_k
+                        
+                        # Find Best Params (Grid Search nos params com o melhor k)
+                        for p in self._generate_configs(param_grid):
+                            model = copy.deepcopy(model_orig)
+                            model.set_params(**p)
+                            model.fit(X_TrS_sc[:, best_feats], y_TrS)
+                            y_pv = model.predict(X_V_sc[:, best_feats])
+                            f1 = compute_metrics(y_V, y_pv)["F1"]
+                            if f1 > best_f1_p:
+                                best_f1_p = f1
+                                best_params = p
+                        
+                        # Final Test
+                        final_mod = copy.deepcopy(model_orig)
+                        final_mod.set_params(**best_params)
+                        final_mod.fit(X_train_sc[:, best_feats], y_train)
+                        y_pt = final_mod.predict(X_test_sc[:, best_feats])
+                        
+                        met = compute_metrics(y_test, y_pt)
+                        cm = compute_confusion_matrix(y_test, y_pt, labels=self.labels)
+                        
+                        fold_res["models"].append({
+                            "model_name": name, 
+                            "best_k": best_k, 
+                            "best_params": best_params,
+                            "test_metrics": met, 
+                            "cm": cm,
+                            # [NOVO] Adiciona o histórico aos resultados finais
+                            "feature_selection_curve": feature_selection_history 
+                        })
+                    all_results.append(fold_res)
+            return all_results
+                            
+    def run_cross_with_validation_feature_selection1(self, number_of_folds=10, n_repeats=1, test_size=0.3, feature_ranking=None):
         all_results = []
         for repeat in range(n_repeats):
             cur_rnd = self.random_state + repeat
@@ -542,8 +659,6 @@ class Experiment:
                     test_mask = np.isin(self.subjects, test_subj)
                     X_train, X_test = self.X[train_mask], self.X[test_mask]
                     y_train, y_test = self.y[train_mask], self.y[test_mask]
-                    
-                    # Inner Split (TrS vs Val)
                     uniq_tr = np.unique(self.subjects[train_mask])
                     np.random.shuffle(uniq_tr)
                     n_val = max(1, int(len(uniq_tr) * test_size))
@@ -654,7 +769,6 @@ class Experiment:
 
         # --- 3. Ciclo por Modelo (ex: MLP, SVM...) ---
         for name, model_orig in self.models.items():
-            print(f"🔬 A analisar {name}...")
             param_grid = self.model_parameters.get(name, {})
             
             # Variáveis para encontrar o campeão deste modelo
@@ -689,10 +803,17 @@ class Experiment:
                     best_model_trained = trained_model 
                     best_history = history
 
-            # --- 5. Teste Final (Apenas com o CAMPEÃO) ---
+           
             if best_model_trained is not None:
-                # Usamos o modelo campeão para prever no Test Set (dados nunca vistos)
-                y_pred_test = best_model_trained.predict(X_test)
+                X_train_val = np.vstack((X_train, X_val))
+                y_train_val = np.concatenate((y_train, y_val))
+                               
+                final_model = copy.deepcopy(model_orig)
+                final_model.set_params(**best_params)
+                
+                # Treinar no conjunto expandido 
+                final_model.fit(X_train_val, y_train_val)
+                y_pred_test = final_model.predict(X_test)
                 
                 metrics_test = compute_metrics(y_test, y_pred_test)
                 cm = compute_confusion_matrix(y_test, y_pred_test, labels=self.labels)
