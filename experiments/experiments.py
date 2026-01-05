@@ -527,7 +527,6 @@ class Experiment:
             for repeat in range(n_repeats):
                 cur_rnd = self.random_state + repeat
                 
-                # --- Definição dos Folds (Inalterado) ---
                 if self.subject_aware_mode:
                     folds = split_subjects_kfold(self.subjects, n_splits=number_of_folds, random_state=cur_rnd)
                 else:
