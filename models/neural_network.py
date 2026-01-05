@@ -11,15 +11,13 @@ class NeuralNetwork(BaseEstimator, ClassifierMixin):
         self.random_state = random_state
         self.verbose = verbose
         
-        # Atributos internos
         self.weights1 = None
         self.bias1 = None
         self.weights2 = None
         self.bias2 = None
         
-        # --- MUDANÇA 1: Variáveis estilo Sklearn ---
-        self.loss_ = 0.0          # Guarda o loss da última iteração
-        self.loss_curve_ = []     # (Opcional) Guarda o histórico todo se quiseres usar depois
+        self.loss_ = 0.0         
+        self.loss_curve_ = []    
         
         self.is_initialized = False
         self.encoder = None
@@ -88,13 +86,12 @@ class NeuralNetwork(BaseEstimator, ClassifierMixin):
         self.weights2 -= self.learning_rate_init * dw2
         self.bias2    -= self.learning_rate_init * db2
 
-        # --- MUDANÇA 2: Guardar Loss e Retornar self ---
         loss_value = -np.mean(np.sum(y_encoded * np.log(a2 + 1e-8), axis=1))
         
         self.loss_ = loss_value          # Atribui ao estilo sklearn
         self.loss_curve_.append(loss_value) 
         
-        return self  # Retorna o objeto, permitindo encadeamento (chaining)
+        return self  
 
     def fit(self, X, y):
         self.loss_curve_ = []
